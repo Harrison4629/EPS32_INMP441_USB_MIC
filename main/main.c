@@ -13,6 +13,9 @@ static const char *TAG = "UAC_INMP441_MIC";
 #define I2S_MIC_BCLK     GPIO_NUM_4
 #define I2S_MIC_WS       GPIO_NUM_5
 #define I2S_MIC_DIN      GPIO_NUM_6
+#define MUTE_BUTTON_PIN  GPIO_NUM_1
+#define MUTE_LED_PIN     GPIO_NUM_2
+
 #define SAMPLE_RATE       48000 // 48kHz 采样率
 
 //每 1 个声音采样点，在内存里都要占用 2 个字节的格子（16-bit PCM），这是 Windows UAC 设备要求的标准格式
@@ -23,6 +26,10 @@ static const char *TAG = "UAC_INMP441_MIC";
 #define MAX_SAMPLES_PER_REQUEST 1024
 
 static i2s_chan_handle_t rx_handle = NULL;
+
+static bool g_hardware_mute = 0;
+
+static bool last_button_state = 1; // 假设初始状态是未按下（高电平）
 
 static void uac_device_set_mute_cb(uint32_t mute, void *arg) 
 {
@@ -90,6 +97,7 @@ static esp_err_t uac_microphone_input_cb(uint8_t *buf, size_t uac_bytes_req, siz
     size_t bytes_read = 0;// 实际从 I2S 硬件 DMA 链表中读取的字节数
     // 从 I2S 硬件 DMA 链表中读取原始 32-bit 的全数字音频，给予 4ms 的超时容错
     esp_err_t ret = i2s_channel_read(rx_handle, raw_buf, i2s_bytes_to_read, &bytes_read, pdMS_TO_TICKS(4));
+
     
     if ((ret == ESP_OK || ret == ESP_ERR_TIMEOUT) && bytes_read > 0) {
         size_t samples_read = bytes_read / I2S_BYTES_PER_SAMPLE; // 计算出实际读取的采样点数
@@ -103,9 +111,19 @@ static esp_err_t uac_microphone_input_cb(uint8_t *buf, size_t uac_bytes_req, siz
         // [ X X X X X X X X X X X X X X X X ]  [ Y Y Y Y Y Y Y Y ] [ 0 0 0 0 0 0 0 0 ]
         // └─── 高16位 ───────────────────────┘ └─────── 低16位 ───────────────────────┘
 
-        for (size_t i = 0; i < samples_read; i++) {
+
+        if (g_hardware_mute) {
+            for (size_t i = 0; i < samples_read; i++) {
+            dst[i] = 0;
+            }
+        } else {
+            for (size_t i = 0; i < samples_read; i++) {
             dst[i] = (int16_t)((uint32_t)raw_buf[i] >> 16);
+            }
+            
         }
+
+        
 
         // 如果底层硬件在当前时间片内没有攒够预期数量的数据，用 0 补齐，防止噪音和断连
         if (samples_read < uac_samples_req) {
@@ -118,6 +136,46 @@ static esp_err_t uac_microphone_input_cb(uint8_t *buf, size_t uac_bytes_req, siz
     
     *out_len = uac_bytes_req;
     return ESP_OK; 
+}
+
+void mute_task(void *pvParameters)
+{
+
+    while (1) {
+        bool current_state = gpio_get_level(MUTE_BUTTON_PIN);
+        
+        // 检测到按键按下（从 1 变 0 瞬间）
+        if (last_button_state == 1 && current_state == 0) {
+            vTaskDelay(pdMS_TO_TICKS(20)); // 软件消抖
+            if (gpio_get_level(MUTE_BUTTON_PIN) == 0) {
+                
+                // 💡 状态翻转
+                g_hardware_mute = !g_hardware_mute;
+                
+                // 💡 状态灯联动（如果是静音就切红灯，解除静音就切绿灯）
+                if (g_hardware_mute) {
+                    gpio_set_level(MUTE_LED_PIN, 0); // 灯灭表示静音
+                    // set_ws2812_color(255, 0, 0); // 伪代码：切红灯
+                } else {
+                    gpio_set_level(MUTE_LED_PIN, 1); // 灯亮表示未静音
+                    // set_ws2812_color(0, 255, 0); // 伪代码：切绿灯
+                }
+            }
+        }
+        last_button_state = current_state;
+        vTaskDelay(pdMS_TO_TICKS(20)); // 降低轮询频率
+    }
+}
+
+void mute_init(void)
+{
+    gpio_reset_pin(MUTE_BUTTON_PIN);
+    gpio_set_direction(MUTE_BUTTON_PIN, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(MUTE_BUTTON_PIN, GPIO_PULLUP_ONLY);
+
+    gpio_reset_pin(MUTE_LED_PIN);
+    gpio_set_direction(MUTE_LED_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(MUTE_LED_PIN, 1); // 初始状态灯亮（假设初始状态是未静音）
 }
 
 void app_main(void)
@@ -136,4 +194,10 @@ void app_main(void)
     // 初始化组件，让底层 TinyUSB 音频栈跑起来
     ESP_ERROR_CHECK(uac_device_init(&uac_config));
     ESP_LOGI(TAG, "USB UAC Stack initialized successfully!");
+
+    mute_init();
+
+    xTaskCreate(mute_task, "button_task", 2048, NULL, 5, NULL);
+    
 }
+
