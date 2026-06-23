@@ -7,6 +7,8 @@
 #include "driver/i2s_std.h" 
 #include "driver/gpio.h"
 
+#include "audio_effects.h"
+
 static const char *TAG = "UAC_INMP441_MIC";
 
 // 引脚定义
@@ -15,6 +17,7 @@ static const char *TAG = "UAC_INMP441_MIC";
 #define I2S_MIC_DIN      GPIO_NUM_6
 #define MUTE_BUTTON_PIN  GPIO_NUM_1
 #define MUTE_LED_PIN     GPIO_NUM_2
+#define MODE_BUTTON_PIN  GPIO_NUM_10
 
 #define SAMPLE_RATE       48000 // 48kHz 采样率
 
@@ -27,9 +30,13 @@ static const char *TAG = "UAC_INMP441_MIC";
 
 static i2s_chan_handle_t rx_handle = NULL;
 
-static bool g_hardware_mute = 0;
+static volatile bool g_hardware_mute = 0;
 
 static bool last_button_state = 1; // 假设初始状态是未按下（高电平）
+
+static bool last_mode_button_state = 1;
+
+volatile MicMode current_mode = MODE_NORMAL;
 
 static void uac_device_set_mute_cb(uint32_t mute, void *arg) 
 {
@@ -40,7 +47,7 @@ static void uac_device_set_volume_cb(uint32_t volume_percent, void *arg)
 {
     // 留空
 }
-static void init_i2s_inmp441(void)
+static void init_i2s_inmp441()
 {
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     
@@ -118,13 +125,12 @@ static esp_err_t uac_microphone_input_cb(uint8_t *buf, size_t uac_bytes_req, siz
             }
         } else {
             for (size_t i = 0; i < samples_read; i++) {
-            dst[i] = (int16_t)((uint32_t)raw_buf[i] >> 16);
-            }
-            
+                    dst[i] = (int16_t)((uint32_t)raw_buf[i] >> 16);
+                }
+            apply_audio_effect(current_mode, dst, samples_read);
         }
 
         
-
         // 如果底层硬件在当前时间片内没有攒够预期数量的数据，用 0 补齐，防止噪音和断连
         if (samples_read < uac_samples_req) {
             memset(buf + (samples_read * UAC_BYTES_PER_SAMPLE), 0, uac_bytes_req - (samples_read * UAC_BYTES_PER_SAMPLE));
@@ -140,12 +146,9 @@ static esp_err_t uac_microphone_input_cb(uint8_t *buf, size_t uac_bytes_req, siz
 
 void mute_task(void *pvParameters)
 {
-
     while (1) {
-        bool current_state = gpio_get_level(MUTE_BUTTON_PIN);
-        
         // 检测到按键按下（从 1 变 0 瞬间）
-        if (last_button_state == 1 && current_state == 0) {
+        if (last_button_state == 1 && gpio_get_level(MUTE_BUTTON_PIN) == 0) {
             vTaskDelay(pdMS_TO_TICKS(20)); // 软件消抖
             if (gpio_get_level(MUTE_BUTTON_PIN) == 0) {
                 
@@ -162,7 +165,36 @@ void mute_task(void *pvParameters)
                 }
             }
         }
-        last_button_state = current_state;
+        last_button_state = gpio_get_level(MUTE_BUTTON_PIN);
+        vTaskDelay(pdMS_TO_TICKS(20)); // 降低轮询频率
+    }
+}
+
+void mode_task(void *pvParameters)
+{
+    while (1) {
+        if (last_mode_button_state == 1 && gpio_get_level(MODE_BUTTON_PIN) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(20)); // 软件消抖
+            
+            if (gpio_get_level(MODE_BUTTON_PIN) == 0) {
+                
+                // 💡 核心切换逻辑：递增并对总数取模，实现 0 -> 1 -> 2 -> 3 -> 0 循环
+                current_mode = (MicMode)((current_mode + 1) % MODE_COUNT);
+                
+                // 💡 状态灯联动（可以根据不同的模式让灯有不同的表现，这里留给你自由发挥）
+                if (current_mode == MODE_NORMAL) {
+                    // set_ws2812_color(0, 255, 0); // 绿灯表示正常
+                } else if (current_mode == MODE_WHITENOISE) {
+                    // set_ws2812_color(255, 0, 0); // 红灯表示炸麦
+                } else if (current_mode == MODE_RADIO) {
+                    // set_ws2812_color(0, 0, 255); // 蓝灯表示 对讲机
+                } else if (current_mode == MODE_ECHO_VOICE) {
+                    // set_ws2812_color(255, 255, 0); // 黄灯表示回声音效
+                }
+            }
+        }
+        
+        last_mode_button_state = gpio_get_level(MODE_BUTTON_PIN);
         vTaskDelay(pdMS_TO_TICKS(20)); // 降低轮询频率
     }
 }
@@ -176,6 +208,13 @@ void mute_init(void)
     gpio_reset_pin(MUTE_LED_PIN);
     gpio_set_direction(MUTE_LED_PIN, GPIO_MODE_OUTPUT);
     gpio_set_level(MUTE_LED_PIN, 1); // 初始状态灯亮（假设初始状态是未静音）
+}
+
+void mode_init(void)
+{
+    gpio_reset_pin(MODE_BUTTON_PIN);
+    gpio_set_direction(MODE_BUTTON_PIN, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(MODE_BUTTON_PIN, GPIO_PULLUP_ONLY);
 }
 
 void app_main(void)
@@ -196,8 +235,11 @@ void app_main(void)
     ESP_LOGI(TAG, "USB UAC Stack initialized successfully!");
 
     mute_init();
+    mode_init();
 
-    xTaskCreate(mute_task, "button_task", 2048, NULL, 5, NULL);
+    xTaskCreate(mute_task, "button_task", 1024, NULL, 1, NULL);
+    xTaskCreate(mode_task, "mode_task", 1024, NULL, 1, NULL);
+
     
 }
 
